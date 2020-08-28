@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# ignore raw midi data
+data/
+
+# ignore vs-code files
+.vscode/
