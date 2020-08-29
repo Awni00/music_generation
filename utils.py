@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+import tensorflow as tf
 import music21
 
 
@@ -72,6 +73,8 @@ def get_notes(mid, chord_root=True, pitch_midi=False, duration_type=True):
 
     if duration_type:
         durs = [note.duration.type for note in notes]
+        # TODO: duration type is string, so takes lot's of space when dataset is large
+        # encode more efficiently
     else:
         durs = [note.duration.quarterLength for note in notes]
 
@@ -177,19 +180,139 @@ def map_song(song):
 
     durations are converted to integers using map_durs.
 
-    pitches in range [0, 11] and durations in range [0, 4] are
-    consolidated into single integer according to:
-    np.dot([len(dur_types), 1], p_d)
-    so that each pitch-duration pair has a unique integer class
+    returns (pitches, durations)
     '''
 
     song_ = np.copy(song) # make a copy of the song so that it isn't modified
 
-    song_[:,1] = map_durs(song_[:, 1])
-    song_ = song_.astype(int)
+    song_pitches = song_[:, 0].astype(int)
+    song_durs = map_durs(song_[:, 1]).astype(int)
 
-    song_ = np.array([pitch_dur_to_int(p_d) for p_d in song_])
 
-    return song_
+    return song_pitches, song_durs
+
+def get_sequences(seq_data, input_length=32, output_length=32, offset=1, shift=1):
+    '''
+    given a song, returns input and output sequences for training generative model.
+
+    Arguments:
+        seq_data: song in the form of a sequence of notes
+        input_length: length of input window
+        output_length: length of output window
+        offset: the offset between the input window and output window
+        shift: the shift between consecutive notes
+
+    Returns:
+        (X, Y): tuple of input windows and output windows
+    '''
+
+    dataset = tf.data.Dataset.from_tensor_slices(seq_data)
+
+    window_length = input_length + offset
+    dataset = dataset.window(window_length, shift=shift, drop_remainder=True)
+    dataset = dataset.flat_map(lambda window: window.batch(window_length))
+    dataset = dataset.map(lambda window: (window[:input_length], window[-output_length:]))
+
+    X = np.array([input for input, label in dataset.as_numpy_iterator()])
+    Y = np.array([label for input, label in dataset.as_numpy_iterator()])
+
+    return X, Y
+
+# endregion
+
+# region modeling and music generation from model
+
+def to_ordinal(x):
+    '''converts one-hot encoding to ordinal encoding.'''
+
+    return np.argmax(x, axis=-1)
+
+def predict_next(model, pitches, durs):
+    '''
+    predicts the next note.
+
+    assumes model which takes [pitches, durs] as input and outputs [pitch, dur]
+    '''
+
+    model_input = [np.array([pitches]), np.array([durs])]
+
+    pred = model.predict(model_input)
+    pred_p, pred_d = pred[0], pred[1]
+    pred_p, pred_d= to_ordinal(pred_p), to_ordinal(pred_d)
+    pred_p, pred_d = np.squeeze(pred_p), np.squeeze(pred_d)
+
+    return pred_p, pred_d
+
+def predict_next_dist(model, pitches, durs):
+    '''
+    predicts the probability distribution of the next note.
+
+    assumes model which takes [pitches, durs] as input and outputs [pitch, dur]
+    '''
+
+    model_input = [np.array([pitches]), np.array([durs])]
+
+    pred = model.predict(model_input)
+    pred_p, pred_d = pred[0], pred[1]
+    pred_p, pred_d = np.squeeze(pred_p), np.squeeze(pred_d)
+
+
+    return pred_p, pred_d
+
+def sample_from_prob(prob_pred, temp=1):
+    '''samples a class from a softmax probability logit'''
+
+    prob_pred_ = np.array(prob_pred) ** (1/temp) # apply temperature to softmax logits
+
+    prob_pred_ /= prob_pred_.sum() # re-normalize
+
+    # sample acccording to (adjusted) class probability distribution
+    sample = np.random.choice(range(len(prob_pred_)), p=prob_pred_)
+
+    return sample
+
+def generate_sequence(model, pitch_seed, dur_seed, n_notes=64, seed_len=None, temp=1):
+    '''generates a sequence of notes.'''
+
+    pitches, durs = [], []
+
+    if not seed_len: seed_len = len(pitch_seed)
+
+    for _ in range(n_notes):
+        pitch_seed = pitch_seed[-seed_len:]
+        dur_seed = dur_seed[-seed_len:]
+
+        pitch_pred, dur_pred = predict_next_dist(model, pitch_seed, dur_seed)
+
+        pitch = sample_from_prob(pitch_pred, temp=temp)
+        dur = sample_from_prob(dur_pred, temp=temp)
+
+        pitches = np.append(pitches, pitch)
+        durs = np.append(durs, dur)
+
+        pitch_seed =  np.append(pitch_seed, pitch)
+        dur_seed =  np.append(dur_seed, dur)
+
+    return pitches, durs
+
+
+def generate_stream(pitch_seq, dur_seq, instrument=music21.instrument.Piano()):
+    '''generates midi file from sequence of pitches and durations'''
+
+    stream = music21.stream.Stream() # create stream object
+    stream.append(instrument) # set instrument
+
+    for pitch, dur in zip(pitch_seq, dur_seq):
+
+        pitch = music21.pitch.Pitch(pitchClass=pitch)
+        dur = music21.duration.Duration(type=inv_durs_int[dur])
+
+        stream.append(music21.note.Note(pitch=pitch, duration=dur))
+
+    return stream
+
+def stream_to_midi(stream, filename):
+    '''write music21 stream to midi file'''
+    stream.write('midi', fp=f'{filename}.mid')
 
 # endregion
